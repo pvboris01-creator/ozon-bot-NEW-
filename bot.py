@@ -273,6 +273,7 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
 def balance_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💰 Текущий баланс", callback_data="balance:current")],
+        [InlineKeyboardButton(text="📅 Баланс на завтра", callback_data="balance:tomorrow")],
         [InlineKeyboardButton(text="📊 Расходы", callback_data="balance:expenses")],
         [InlineKeyboardButton(text="🏠 В главное меню", callback_data="menu:home")],
     ])
@@ -902,6 +903,72 @@ async def cb_balance_current(cb: CallbackQuery):
             f"<code>OZON_SELLER_API_KEY</code> в <code>.env</code>.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="🔄 Повторить", callback_data="balance:current")],
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:balance")],
+            ]),
+            parse_mode="HTML"
+        )
+
+
+@dp.callback_query(F.data == "balance:tomorrow")
+async def cb_balance_tomorrow(cb: CallbackQuery):
+    """Баланс на завтра = текущий баланс − расход за сегодня."""
+    if not has_access(cb.from_user.id):
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+
+    await cb.answer("Считаю...")
+    try:
+        # 1. Текущий баланс
+        data = await get_balance()
+        total = data.get("total", {}) or {}
+        closing = total.get("closing_balance", {}) or {}
+        balance_now = closing.get("value", 0)
+
+        # 2. Расход за сегодня
+        today_msk = datetime.now(MOSCOW_TZ).date().isoformat()
+        rows = await get_daily_stats(today_msk, today_msk)
+        agg = aggregate_daily(rows)
+        expense_today = sum(v["expense"] for v in agg.values())
+
+        # 3. Прогноз баланса на завтра
+        balance_tomorrow = balance_now - expense_today
+
+        # Форматируем
+        today_date = datetime.now(MOSCOW_TZ).date()
+        tomorrow_date = today_date + timedelta(days=1)
+
+        # Выбираем иконку по «остатку»
+        if balance_tomorrow > 1000:
+            icon = "🟢"
+        elif balance_tomorrow > 0:
+            icon = "🟡"
+        else:
+            icon = "🔴"
+
+        text = (
+            f"📅 <b>Баланс на завтра</b>\n"
+            f"<i>Прогноз на {tomorrow_date.isoformat()} (МСК)</i>\n\n"
+            f"💰 Баланс сейчас: <b>{balance_now:,.2f} ₽</b>\n"
+            f"💸 Расход за сегодня: <b>− {expense_today:,.2f} ₽</b>\n"
+            f"──────────────\n"
+            f"{icon} <b>Баланс на завтра: {balance_tomorrow:,.2f} ₽</b>"
+        )
+        await cb.message.edit_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Обновить", callback_data="balance:tomorrow")],
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:balance")],
+                [InlineKeyboardButton(text="🏠 В главное меню", callback_data="menu:home")],
+            ]),
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        await cb.message.edit_text(
+            f"❌ Не удалось рассчитать баланс на завтра.\n\n"
+            f"Ошибка: <code>{e}</code>\n\n"
+            f"Проверь ключи Seller API и Performance API в <code>.env</code>.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Повторить", callback_data="balance:tomorrow")],
                 [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:balance")],
             ]),
             parse_mode="HTML"
