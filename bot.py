@@ -20,6 +20,7 @@ from ozon_perf import (
     activate_campaign,
     deactivate_campaign,
     get_balance,
+    get_postings_in_transit,
 )
 
 load_dotenv()
@@ -117,6 +118,9 @@ def has_access(user_id: int) -> bool:
 def parse_money(s) -> float:
     if s is None:
         return 0.0
+    # Ozon отдаёт цены как {"amount": "3315", "currency": "RUB"}
+    if isinstance(s, dict):
+        return parse_money(s.get("amount"))
     if isinstance(s, (int, float)):
         return float(s)
     s = str(s).strip().replace(" ", "").replace(",", ".")
@@ -274,6 +278,7 @@ def balance_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💰 Текущий баланс", callback_data="balance:current")],
         [InlineKeyboardButton(text="📅 Баланс на завтра", callback_data="balance:tomorrow")],
+        [InlineKeyboardButton(text="🚚 Товары в пути", callback_data="balance:transit")],
         [InlineKeyboardButton(text="📊 Расходы", callback_data="balance:expenses")],
         [InlineKeyboardButton(text="🏠 В главное меню", callback_data="menu:home")],
     ])
@@ -705,6 +710,73 @@ async def build_bids_view_keyboard(campaign_id: str, page: int):
     return text, InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
+# ---------- ТОВАРЫ В ПУТИ ----------
+async def build_transit_view():
+    """Показать товары в пути (статус delivering)."""
+    try:
+        data = await get_postings_in_transit(days_back=30)
+    except Exception as e:
+        return f"❌ Ошибка получения данных: {e}", None
+
+    postings = data.get("postings", []) or []
+
+    if not postings:
+        return (
+            "🚚 <b>Товары в пути</b>\n\n"
+            "Сейчас нет отправлений в доставке.",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Обновить", callback_data="balance:transit")],
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:balance")],
+                [InlineKeyboardButton(text="🏠 В главное меню", callback_data="menu:home")],
+            ])
+        )
+
+    total_items = 0
+    total_buyer = 0.0
+    total_seller = 0.0
+
+    for p in postings:
+        fin = p.get("financial_data", {}) or {}
+        fin_products = fin.get("products", []) or []
+
+        if fin_products:
+            for fp in fin_products:
+                qty = parse_int(fp.get("quantity")) or 1
+                total_items += qty
+
+                buyer_price = parse_money(fp.get("customer_price"))
+                total_buyer += buyer_price * qty
+
+                seller_price = parse_money(fp.get("price"))
+                total_seller += seller_price * qty
+        else:
+            products = p.get("products", []) or []
+            for prod in products:
+                qty = parse_int(prod.get("quantity")) or 1
+                total_items += qty
+
+                price = parse_money(prod.get("price"))
+                total_buyer += price * qty
+                total_seller += price * qty
+
+    text = (
+        f"🚚 <b>Товары в пути (в доставке)</b>\n\n"
+        f"📦 Отправлений: <b>{len(postings)}</b>\n"
+        f"📦 Товаров (штук): <b>{total_items}</b>\n\n"
+        f"💰 <b>Уплачено покупателями:</b>\n"
+        f"   <b>{total_buyer:,.2f} ₽</b>\n\n"
+        f"🏷 <b>По вашим ценам:</b>\n"
+        f"   <b>{total_seller:,.2f} ₽</b>"
+    )
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="balance:transit")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:balance")],
+        [InlineKeyboardButton(text="🏠 В главное меню", callback_data="menu:home")],
+    ])
+    return text, keyboard
+
+
 # ---------- ВСПОМОГАТЕЛЬНЫЕ ----------
 async def do_period(days: int) -> str:
     date_to_msk = datetime.now(MOSCOW_TZ).date()
@@ -911,33 +983,27 @@ async def cb_balance_current(cb: CallbackQuery):
 
 @dp.callback_query(F.data == "balance:tomorrow")
 async def cb_balance_tomorrow(cb: CallbackQuery):
-    """Баланс на завтра = текущий баланс − расход за сегодня."""
     if not has_access(cb.from_user.id):
         await cb.answer("Нет доступа", show_alert=True)
         return
 
     await cb.answer("Считаю...")
     try:
-        # 1. Текущий баланс
         data = await get_balance()
         total = data.get("total", {}) or {}
         closing = total.get("closing_balance", {}) or {}
         balance_now = closing.get("value", 0)
 
-        # 2. Расход за сегодня
         today_msk = datetime.now(MOSCOW_TZ).date().isoformat()
         rows = await get_daily_stats(today_msk, today_msk)
         agg = aggregate_daily(rows)
         expense_today = sum(v["expense"] for v in agg.values())
 
-        # 3. Прогноз баланса на завтра
         balance_tomorrow = balance_now - expense_today
 
-        # Форматируем
         today_date = datetime.now(MOSCOW_TZ).date()
         tomorrow_date = today_date + timedelta(days=1)
 
-        # Выбираем иконку по «остатку»
         if balance_tomorrow > 1000:
             icon = "🟢"
         elif balance_tomorrow > 0:
@@ -965,13 +1031,36 @@ async def cb_balance_tomorrow(cb: CallbackQuery):
     except Exception as e:
         await cb.message.edit_text(
             f"❌ Не удалось рассчитать баланс на завтра.\n\n"
-            f"Ошибка: <code>{e}</code>\n\n"
-            f"Проверь ключи Seller API и Performance API в <code>.env</code>.",
+            f"Ошибка: <code>{e}</code>",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="🔄 Повторить", callback_data="balance:tomorrow")],
                 [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:balance")],
             ]),
             parse_mode="HTML"
+        )
+
+
+@dp.callback_query(F.data == "balance:transit")
+async def cb_balance_transit(cb: CallbackQuery):
+    if not has_access(cb.from_user.id):
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+
+    await cb.answer("Загружаю данные...")
+    try:
+        text, kb = await build_transit_view()
+        if kb is None:
+            await cb.message.edit_text(text)
+        else:
+            await cb.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception as e:
+        await cb.message.edit_text(
+            f"❌ Ошибка: <code>{e}</code>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Повторить", callback_data="balance:transit")],
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:balance")],
+            ])
         )
 
 
