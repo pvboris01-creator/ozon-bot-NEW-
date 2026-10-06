@@ -47,7 +47,8 @@ THRESHOLDS = [500, 1000, 1500, 2000]
 CHECK_INTERVAL_MINUTES = 7
 STATE_FILE = "thresholds_state.json"
 LIMITS_FILE = "daily_limits.json"
-AUTO_REACTIVATE_FILE = "auto_reactivate.json"  # ← кампании для автовключения
+AUTO_REACTIVATE_FILE = "auto_reactivate.json"
+LIMIT_TRIGGERED_FILE = "limit_triggered.json"
 
 
 # ---------- JSON ----------
@@ -106,7 +107,6 @@ def get_limit(campaign_id: str) -> float:
 
 # ---------- АВТОВКЛЮЧЕНИЕ ----------
 def load_auto_reactivate() -> dict:
-    """{campaign_id: True/False}."""
     return load_json(AUTO_REACTIVATE_FILE)
 
 
@@ -126,10 +126,37 @@ def toggle_auto_reactivate(campaign_id: str) -> bool:
     if new_val:
         data[cid] = True
     else:
-        # Не храним лишние False — удаляем запись
         data.pop(cid, None)
     save_auto_reactivate(data)
     return new_val
+
+
+# ---------- ЛИМИТЫ: ОТМЕТКА О СРАБАТЫВАНИИ ----------
+def get_limit_triggered_today() -> set:
+    data = load_json(LIMIT_TRIGGERED_FILE)
+    today = datetime.now(MOSCOW_TZ).date().isoformat()
+    return set(data.get(today, []))
+
+
+def mark_limit_triggered(campaign_id: str):
+    data = load_json(LIMIT_TRIGGERED_FILE)
+    today = datetime.now(MOSCOW_TZ).date().isoformat()
+    today_list = set(data.get(today, []))
+    today_list.add(str(campaign_id))
+    data[today] = sorted(today_list)
+    for old_date in list(data.keys()):
+        if old_date != today:
+            del data[old_date]
+    save_json(LIMIT_TRIGGERED_FILE, data)
+
+
+def clear_limit_triggered(campaign_id: str):
+    data = load_json(LIMIT_TRIGGERED_FILE)
+    today = datetime.now(MOSCOW_TZ).date().isoformat()
+    today_list = set(data.get(today, []))
+    today_list.discard(str(campaign_id))
+    data[today] = sorted(today_list)
+    save_json(LIMIT_TRIGGERED_FILE, data)
 
 
 # ---------- FSM ----------
@@ -460,7 +487,6 @@ async def build_auto_menu_keyboard(page: int):
     except Exception as e:
         return f"❌ Ошибка получения кампаний: {e}", None
 
-    # Показываем только CPC
     filtered = [c for c in campaigns if c.get("PaymentType") == "CPC"]
     now = datetime.now(timezone.utc)
     filtered.sort(key=lambda c: campaign_priority(c, now))
@@ -503,7 +529,6 @@ async def build_auto_menu_keyboard(page: int):
     buttons.append([InlineKeyboardButton(text="⬅️ Назад к кампаниям", callback_data="menu:campaigns")])
     buttons.append([InlineKeyboardButton(text="🏠 В главное меню", callback_data="menu:home")])
 
-    # Подсчёт активных
     auto_data = load_auto_reactivate()
     active_count = sum(1 for v in auto_data.values() if v)
 
@@ -1275,7 +1300,6 @@ async def cb_auto_toggle(cb: CallbackQuery):
     campaign_id = cb.data.split(":", 1)[1]
     new_state = toggle_auto_reactivate(campaign_id)
 
-    # Получаем название кампании для уведомления
     camp_name = campaign_id
     try:
         campaigns = await get_campaigns()
@@ -1290,9 +1314,7 @@ async def cb_auto_toggle(cb: CallbackQuery):
         show_alert=False
     )
 
-    # Перерисовываем то же окно
     try:
-        # Найдём страницу, на которой была кампания, но проще — оставить первую
         text, kb = await build_auto_menu_keyboard(0)
         if kb:
             await cb.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
@@ -1565,6 +1587,7 @@ async def process_limit_amount(msg: Message, state: FSMContext):
         return
 
     set_limit(cid, amount)
+    clear_limit_triggered(cid)
     await state.clear()
 
     if amount == 0:
@@ -1652,24 +1675,47 @@ async def check_thresholds():
             str(c.get("id")): (c.get("title") or str(c.get("id")))
             for c in campaigns
         }
+        camps_state = {
+            str(c.get("id")): c.get("state")
+            for c in campaigns
+        }
+
+        triggered = get_limit_triggered_today()
 
         for cid_str, limit in list(limits.items()):
             if not limit or limit <= 0:
                 continue
+
             spent = agg.get(cid_str, {}).get("expense", 0.0)
-            if spent >= limit:
-                name = camp_names.get(cid_str, cid_str)
-                try:
-                    await deactivate_campaign(int(cid_str))
-                    alert = format_limit_alert(name, cid_str, limit, spent)
-                    for uid in ALLOWED_IDS:
-                        try:
-                            await bot.send_message(uid, alert, parse_mode="HTML")
-                        except Exception:
-                            pass
-                    print(f"Кампания {cid_str} отключена (лимит {limit}, расход {spent:.2f}). Лимит сохранён.")
-                except Exception as e:
-                    print(f"Не удалось отключить кампанию {cid_str}: {e}")
+            if spent < limit:
+                continue
+
+            state = camps_state.get(cid_str)
+            name = camp_names.get(cid_str, cid_str)
+
+            # Если кампания уже не RUNNING — значит, мы её уже отключили ранее (или вручную).
+            # Больше никаких действий и уведомлений не делаем.
+            if state != "CAMPAIGN_STATE_RUNNING":
+                continue
+
+            # Кампания активна и превысила лимит — отключаем
+            try:
+                await deactivate_campaign(int(cid_str))
+                print(f"Кампания {cid_str} отключена (лимит {limit}, расход {spent:.2f}).")
+            except Exception as e:
+                print(f"Не удалось отключить кампанию {cid_str}: {e}")
+                continue
+
+            # Уведомление — только один раз в день
+            if str(cid_str) not in triggered:
+                alert = format_limit_alert(name, cid_str, limit, spent)
+                for uid in ALLOWED_IDS:
+                    try:
+                        await bot.send_message(uid, alert, parse_mode="HTML")
+                    except Exception:
+                        pass
+                mark_limit_triggered(cid_str)
+                print(f"Уведомление по лимиту {cid_str} отправлено (расход {spent:.2f}).")
     except Exception as e:
         print(f"Ошибка проверки: {e}")
 
@@ -1684,14 +1730,12 @@ async def auto_reactivate_campaigns():
             print("Автовключение: список пуст, пропускаю.")
             return
 
-        # Получаем текущие статусы кампаний
         try:
             campaigns = await get_campaigns()
         except Exception as e:
             print(f"Автовключение: не удалось получить кампании: {e}")
             return
 
-        # Словарь id -> campaign
         camps_by_id = {str(c.get("id")): c for c in campaigns}
 
         activated = []
@@ -1715,7 +1759,6 @@ async def auto_reactivate_campaigns():
             except Exception as e:
                 failed.append((cid, str(e)))
 
-        # Формируем уведомление
         lines = ["🔁 <b>Автовключение кампаний (00:05 МСК)</b>", ""]
         if activated:
             lines.append(f"✅ <b>Включено ({len(activated)}):</b>")
@@ -1745,15 +1788,11 @@ async def auto_reactivate_campaigns():
 
 # ---------- ЗАПУСК ----------
 async def main():
-    # Проверка порогов и лимитов — каждые 7 минут
     scheduler.add_job(check_thresholds, "interval", minutes=CHECK_INTERVAL_MINUTES)
-
-    # Автовключение — каждый день в 00:05 по Москве
     scheduler.add_job(
         auto_reactivate_campaigns,
         CronTrigger(hour=0, minute=5, timezone=MOSCOW_TZ),
     )
-
     scheduler.start()
     print(
         f"Бот запущен. Доступ у: {ALLOWED_IDS}. "
