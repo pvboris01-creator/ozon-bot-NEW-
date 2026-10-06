@@ -189,7 +189,6 @@ async def get_balance(date_from: str = None, date_to: str = None) -> dict:
 
 # ---------- SELLER: ТОВАРЫ В ПУТИ ----------
 async def get_postings_in_transit(days_back: int = 30) -> dict:
-    """Отправления FBS со статусом 'delivering' (в доставке)."""
     from datetime import datetime, timedelta, timezone
 
     headers = {
