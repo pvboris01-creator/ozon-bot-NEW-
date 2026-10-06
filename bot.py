@@ -43,6 +43,7 @@ BID_PAGE_SIZE = 6
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
 THRESHOLDS = [500, 1000, 1500, 2000]
+CHECK_INTERVAL_MINUTES = 7  # ← интервал проверки расходов
 STATE_FILE = "thresholds_state.json"
 LIMITS_FILE = "daily_limits.json"
 
@@ -118,7 +119,6 @@ def has_access(user_id: int) -> bool:
 def parse_money(s) -> float:
     if s is None:
         return 0.0
-    # Ozon отдаёт цены как {"amount": "3315", "currency": "RUB"}
     if isinstance(s, dict):
         return parse_money(s.get("amount"))
     if isinstance(s, (int, float)):
@@ -260,7 +260,8 @@ def format_limit_alert(campaign_name: str, campaign_id: str, limit: float, spent
         f"📋 Кампания: <b>{campaign_name}</b> (ID: {campaign_id})\n"
         f"💰 Лимит: <b>{limit:,.2f} ₽</b>\n"
         f"💸 Потрачено: <b>{spent:,.2f} ₽</b>\n\n"
-        f"⏹ <b>Кампания автоматически отключена.</b>"
+        f"⏹ <b>Кампания автоматически отключена.</b>\n"
+        f"<i>Лимит сохранён, кампания останется выключенной до ручного включения.</i>"
     )
 
 
@@ -336,8 +337,14 @@ async def build_campaigns_keyboard(mode: str, page: int):
     else:
         filtered = list(campaigns)
 
+    # === СОРТИРОВКА: сначала по расходам (большие → меньшие) ===
     now = datetime.now(timezone.utc)
-    filtered.sort(key=lambda c: campaign_priority(c, now))
+    filtered.sort(
+        key=lambda c: (
+            -expense_by_campaign.get(str(c.get("id")), 0.0),
+            campaign_priority(c, now),
+        )
+    )
 
     total_pages = max(1, (len(filtered) + PAGE_SIZE - 1) // PAGE_SIZE)
     page = max(0, min(page, total_pages - 1))
@@ -408,7 +415,8 @@ async def build_campaigns_keyboard(mode: str, page: int):
         f"📉 ДРР: {drr_today:.1f}%\n"
         f"──────────────\n"
         f"📋 <b>Кампании</b> ({label}) — найдено <b>{len(filtered)}</b>, "
-        f"страница {page+1}/{total_pages}"
+        f"страница {page+1}/{total_pages}\n"
+        f"<i>Сортировка: от больших затрат к меньшим</i>"
     )
     return text, InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -468,7 +476,8 @@ async def build_limits_keyboard(page: int):
         f"⚙️ <b>Настройка дневных лимитов</b>\n\n"
         f"Нажми на кампанию, чтобы задать или изменить лимит.\n"
         f"Отправь <code>0</code> при вводе, чтобы <b>убрать</b> лимит.\n"
-        f"Кампании без лимита <b>не отключаются</b> автоматически.\n\n"
+        f"Кампании без лимита <b>не отключаются</b> автоматически.\n"
+        f"После срабатывания лимит <b>сохраняется</b> — кампания остаётся выключенной.\n\n"
         f"Страница {page+1}/{total_pages}"
     )
     return text, InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -712,7 +721,6 @@ async def build_bids_view_keyboard(campaign_id: str, page: int):
 
 # ---------- ТОВАРЫ В ПУТИ ----------
 async def build_transit_view():
-    """Показать товары в пути (статус delivering)."""
     try:
         data = await get_postings_in_transit(days_back=30)
     except Exception as e:
@@ -1468,6 +1476,7 @@ async def check_thresholds():
         agg = aggregate_daily(rows)
         total = sum(v["expense"] for v in agg.values())
 
+        # ----- Пороги -----
         notified = get_notified_today()
         for threshold in THRESHOLDS:
             if total >= threshold and threshold not in notified:
@@ -1479,6 +1488,7 @@ async def check_thresholds():
                         pass
                 mark_notified(threshold)
 
+        # ----- Лимиты -----
         limits = load_limits()
         if not limits:
             return
@@ -1503,8 +1513,8 @@ async def check_thresholds():
                             await bot.send_message(uid, alert, parse_mode="HTML")
                         except Exception:
                             pass
-                    limits[cid_str] = 0
-                    save_limits(limits)
+                    # ⚠️ Лимит НЕ сбрасываем — оставляем как есть.
+                    print(f"Кампания {cid_str} отключена (лимит {limit}, расход {spent:.2f}). Лимит сохранён.")
                 except Exception as e:
                     print(f"Не удалось отключить кампанию {cid_str}: {e}")
     except Exception as e:
@@ -1513,9 +1523,12 @@ async def check_thresholds():
 
 # ---------- ЗАПУСК ----------
 async def main():
-    scheduler.add_job(check_thresholds, "interval", minutes=30)
+    scheduler.add_job(check_thresholds, "interval", minutes=CHECK_INTERVAL_MINUTES)
     scheduler.start()
-    print(f"Бот запущен. Доступ у: {ALLOWED_IDS}. Пороги: {THRESHOLDS}")
+    print(
+        f"Бот запущен. Доступ у: {ALLOWED_IDS}. "
+        f"Пороги: {THRESHOLDS}. Интервал проверки: {CHECK_INTERVAL_MINUTES} мин."
+    )
     await dp.start_polling(bot)
 
 
