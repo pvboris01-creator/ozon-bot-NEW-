@@ -10,6 +10,7 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 from ozon_perf import (
     get_campaigns,
@@ -43,9 +44,10 @@ BID_PAGE_SIZE = 6
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
 THRESHOLDS = [500, 1000, 1500, 2000]
-CHECK_INTERVAL_MINUTES = 7  # ← интервал проверки расходов
+CHECK_INTERVAL_MINUTES = 7
 STATE_FILE = "thresholds_state.json"
 LIMITS_FILE = "daily_limits.json"
+AUTO_REACTIVATE_FILE = "auto_reactivate.json"  # ← кампании для автовключения
 
 
 # ---------- JSON ----------
@@ -100,6 +102,34 @@ def set_limit(campaign_id: str, limit: float):
 def get_limit(campaign_id: str) -> float:
     limits = load_limits()
     return limits.get(str(campaign_id), 0.0)
+
+
+# ---------- АВТОВКЛЮЧЕНИЕ ----------
+def load_auto_reactivate() -> dict:
+    """{campaign_id: True/False}."""
+    return load_json(AUTO_REACTIVATE_FILE)
+
+
+def save_auto_reactivate(data: dict):
+    save_json(AUTO_REACTIVATE_FILE, data)
+
+
+def is_auto_reactivate(campaign_id: str) -> bool:
+    data = load_auto_reactivate()
+    return bool(data.get(str(campaign_id), False))
+
+
+def toggle_auto_reactivate(campaign_id: str) -> bool:
+    data = load_auto_reactivate()
+    cid = str(campaign_id)
+    new_val = not bool(data.get(cid, False))
+    if new_val:
+        data[cid] = True
+    else:
+        # Не храним лишние False — удаляем запись
+        data.pop(cid, None)
+    save_auto_reactivate(data)
+    return new_val
 
 
 # ---------- FSM ----------
@@ -254,6 +284,7 @@ def format_threshold_alert(threshold: int, total: float, agg: dict) -> str:
 
 def format_limit_alert(campaign_name: str, campaign_id: str, limit: float, spent: float) -> str:
     today_str = datetime.now(MOSCOW_TZ).date().isoformat()
+    auto = "🔁 Автовключение: ВКЛ" if is_auto_reactivate(campaign_id) else "🔁 Автовключение: ВЫКЛ"
     return (
         f"🚨 <b>Превышен дневной лимит</b>\n"
         f"Дата: {today_str} (МСК)\n\n"
@@ -261,7 +292,8 @@ def format_limit_alert(campaign_name: str, campaign_id: str, limit: float, spent
         f"💰 Лимит: <b>{limit:,.2f} ₽</b>\n"
         f"💸 Потрачено: <b>{spent:,.2f} ₽</b>\n\n"
         f"⏹ <b>Кампания автоматически отключена.</b>\n"
-        f"<i>Лимит сохранён, кампания останется выключенной до ручного включения.</i>"
+        f"<i>Лимит сохранён, кампания останется выключенной до ручного включения.</i>\n"
+        f"{auto}"
     )
 
 
@@ -337,7 +369,6 @@ async def build_campaigns_keyboard(mode: str, page: int):
     else:
         filtered = list(campaigns)
 
-    # === СОРТИРОВКА: сначала по расходам (большие → меньшие) ===
     now = datetime.now(timezone.utc)
     filtered.sort(
         key=lambda c: (
@@ -398,6 +429,7 @@ async def build_campaigns_keyboard(mode: str, page: int):
 
     buttons.append([InlineKeyboardButton(text="📈 Статистика кампаний", callback_data="stats_menu:0")])
     buttons.append([InlineKeyboardButton(text="⚙️ Настроить лимиты", callback_data="limits_menu:0")])
+    buttons.append([InlineKeyboardButton(text="🔁 Автовключение", callback_data="auto_menu:0")])
 
     if mode == "cpc":
         buttons.append([InlineKeyboardButton(text="💰 Оплата за заказ", callback_data="pg:cpo:0")])
@@ -417,6 +449,71 @@ async def build_campaigns_keyboard(mode: str, page: int):
         f"📋 <b>Кампании</b> ({label}) — найдено <b>{len(filtered)}</b>, "
         f"страница {page+1}/{total_pages}\n"
         f"<i>Сортировка: от больших затрат к меньшим</i>"
+    )
+    return text, InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+# ---------- АВТОВКЛЮЧЕНИЕ: КЛАВИАТУРА ----------
+async def build_auto_menu_keyboard(page: int):
+    try:
+        campaigns = await get_campaigns()
+    except Exception as e:
+        return f"❌ Ошибка получения кампаний: {e}", None
+
+    # Показываем только CPC
+    filtered = [c for c in campaigns if c.get("PaymentType") == "CPC"]
+    now = datetime.now(timezone.utc)
+    filtered.sort(key=lambda c: campaign_priority(c, now))
+
+    total_pages = max(1, (len(filtered) + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * PAGE_SIZE
+    chunk = filtered[start:start + PAGE_SIZE]
+
+    buttons = []
+    for c in chunk:
+        cid = str(c.get("id"))
+        title = c.get("title") or c.get("advObjectType") or "Кампания"
+        if len(title) > 26:
+            title = title[:23] + "..."
+
+        enabled = is_auto_reactivate(cid)
+        mark = "✅" if enabled else "⬜"
+        text = f"{mark} {title}"
+
+        buttons.append([
+            InlineKeyboardButton(
+                text=text[:64],
+                callback_data=f"auto_toggle:{cid}"
+            )
+        ])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"auto_menu:{page-1}"))
+    else:
+        nav.append(InlineKeyboardButton(text="·", callback_data="noop"))
+    nav.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"auto_menu:{page+1}"))
+    else:
+        nav.append(InlineKeyboardButton(text="·", callback_data="noop"))
+    buttons.append(nav)
+
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад к кампаниям", callback_data="menu:campaigns")])
+    buttons.append([InlineKeyboardButton(text="🏠 В главное меню", callback_data="menu:home")])
+
+    # Подсчёт активных
+    auto_data = load_auto_reactivate()
+    active_count = sum(1 for v in auto_data.values() if v)
+
+    text = (
+        f"🔁 <b>Автовключение кампаний</b>\n\n"
+        f"Отметь кампании, которые нужно включать автоматически "
+        f"каждый день после <b>00:05 (МСК)</b>.\n\n"
+        f"✅ — включено · ⬜ — выключено\n"
+        f"Активных автовключений: <b>{active_count}</b>\n\n"
+        f"Страница {page+1}/{total_pages}"
     )
     return text, InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -1146,6 +1243,63 @@ async def cb_menu_bids(cb: CallbackQuery):
         await cb.answer(f"❌ Ошибка: {e}", show_alert=True)
 
 
+# ---------- АВТОВКЛЮЧЕНИЕ: ОБРАБОТЧИКИ ----------
+@dp.callback_query(F.data.startswith("auto_menu:"))
+async def cb_auto_menu(cb: CallbackQuery):
+    if not has_access(cb.from_user.id):
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        _, page_str = cb.data.split(":")
+        page = int(page_str)
+    except Exception:
+        page = 0
+
+    await cb.answer("Загружаю...")
+    try:
+        text, kb = await build_auto_menu_keyboard(page)
+        if kb is None:
+            await cb.message.edit_text(text)
+        else:
+            await cb.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception as e:
+        await cb.answer(f"❌ Ошибка: {e}", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("auto_toggle:"))
+async def cb_auto_toggle(cb: CallbackQuery):
+    if not has_access(cb.from_user.id):
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+
+    campaign_id = cb.data.split(":", 1)[1]
+    new_state = toggle_auto_reactivate(campaign_id)
+
+    # Получаем название кампании для уведомления
+    camp_name = campaign_id
+    try:
+        campaigns = await get_campaigns()
+        camp = next((c for c in campaigns if str(c.get("id")) == campaign_id), None)
+        if camp:
+            camp_name = camp.get("title") or camp_name
+    except Exception:
+        pass
+
+    await cb.answer(
+        f"{'✅ Автовключение ВКЛ' if new_state else '⬜ Автовключение ВЫКЛ'}: {camp_name[:30]}",
+        show_alert=False
+    )
+
+    # Перерисовываем то же окно
+    try:
+        # Найдём страницу, на которой была кампания, но проще — оставить первую
+        text, kb = await build_auto_menu_keyboard(0)
+        if kb:
+            await cb.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        pass
+
+
 # ---------- КНОПКИ КАМПАНИЙ ----------
 @dp.callback_query(F.data == "noop")
 async def cb_noop(cb: CallbackQuery):
@@ -1468,7 +1622,7 @@ async def cb_on(cb: CallbackQuery):
         await cb.answer(f"❌ Ошибка: {e}", show_alert=True)
 
 
-# ---------- ПОРОГИ И ЛИМИТЫ ----------
+# ---------- ПРОВЕРКА ПОРОГОВ И ЛИМИТОВ ----------
 async def check_thresholds():
     try:
         today_str = datetime.now(MOSCOW_TZ).date().isoformat()
@@ -1513,7 +1667,6 @@ async def check_thresholds():
                             await bot.send_message(uid, alert, parse_mode="HTML")
                         except Exception:
                             pass
-                    # ⚠️ Лимит НЕ сбрасываем — оставляем как есть.
                     print(f"Кампания {cid_str} отключена (лимит {limit}, расход {spent:.2f}). Лимит сохранён.")
                 except Exception as e:
                     print(f"Не удалось отключить кампанию {cid_str}: {e}")
@@ -1521,13 +1674,91 @@ async def check_thresholds():
         print(f"Ошибка проверки: {e}")
 
 
+# ---------- АВТОВКЛЮЧЕНИЕ ПО РАСПИСАНИЮ (00:05 МСК) ----------
+async def auto_reactivate_campaigns():
+    """Каждый день в 00:05 МСК включает все кампании из списка автовключения."""
+    try:
+        data = load_auto_reactivate()
+        campaign_ids = [cid for cid, val in data.items() if val]
+        if not campaign_ids:
+            print("Автовключение: список пуст, пропускаю.")
+            return
+
+        # Получаем текущие статусы кампаний
+        try:
+            campaigns = await get_campaigns()
+        except Exception as e:
+            print(f"Автовключение: не удалось получить кампании: {e}")
+            return
+
+        # Словарь id -> campaign
+        camps_by_id = {str(c.get("id")): c for c in campaigns}
+
+        activated = []
+        skipped = []
+        failed = []
+
+        for cid in campaign_ids:
+            camp = camps_by_id.get(str(cid))
+            if not camp:
+                skipped.append(cid)
+                continue
+
+            state = camp.get("state")
+            if state == "CAMPAIGN_STATE_RUNNING":
+                skipped.append(cid)
+                continue
+
+            try:
+                await activate_campaign(int(cid))
+                activated.append((cid, camp.get("title") or cid))
+            except Exception as e:
+                failed.append((cid, str(e)))
+
+        # Формируем уведомление
+        lines = ["🔁 <b>Автовключение кампаний (00:05 МСК)</b>", ""]
+        if activated:
+            lines.append(f"✅ <b>Включено ({len(activated)}):</b>")
+            for cid, name in activated:
+                lines.append(f"• {name}")
+            lines.append("")
+        if skipped:
+            lines.append(f"⏭ <i>Уже активны или не найдены: {len(skipped)}</i>")
+        if failed:
+            lines.append(f"❌ <b>Ошибки ({len(failed)}):</b>")
+            for cid, err in failed:
+                lines.append(f"• {cid}: {err[:80]}")
+
+        text = "\n".join(lines)
+
+        for uid in ALLOWED_IDS:
+            try:
+                await bot.send_message(uid, text, parse_mode="HTML")
+            except Exception:
+                pass
+
+        print(f"Автовключение выполнено: активировано {len(activated)}, пропущено {len(skipped)}, ошибок {len(failed)}")
+
+    except Exception as e:
+        print(f"Ошибка автовключения: {e}")
+
+
 # ---------- ЗАПУСК ----------
 async def main():
+    # Проверка порогов и лимитов — каждые 7 минут
     scheduler.add_job(check_thresholds, "interval", minutes=CHECK_INTERVAL_MINUTES)
+
+    # Автовключение — каждый день в 00:05 по Москве
+    scheduler.add_job(
+        auto_reactivate_campaigns,
+        CronTrigger(hour=0, minute=5, timezone=MOSCOW_TZ),
+    )
+
     scheduler.start()
     print(
         f"Бот запущен. Доступ у: {ALLOWED_IDS}. "
-        f"Пороги: {THRESHOLDS}. Интервал проверки: {CHECK_INTERVAL_MINUTES} мин."
+        f"Пороги: {THRESHOLDS}. Интервал проверки: {CHECK_INTERVAL_MINUTES} мин. "
+        f"Автовключение: 00:05 МСК."
     )
     await dp.start_polling(bot)
 
