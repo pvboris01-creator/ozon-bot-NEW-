@@ -51,6 +51,15 @@ AUTO_REACTIVATE_FILE = "auto_reactivate.json"
 LIMIT_TRIGGERED_FILE = "limit_triggered.json"
 
 
+# ---------- УТИЛИТА: обрезка текста для cb.answer ----------
+def short(text: str, limit: int = 190) -> str:
+    """Обрезаем текст, чтобы не поймать MESSAGE_TOO_LONG."""
+    text = str(text)
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
+
+
 # ---------- JSON ----------
 def load_json(path: str) -> dict:
     try:
@@ -1041,7 +1050,7 @@ async def cb_stats_period(cb: CallbackQuery):
             ])
         )
     except Exception as e:
-        await cb.answer(f"❌ Ошибка: {e}", show_alert=True)
+        await cb.answer(short(f"❌ Ошибка: {e}"), show_alert=True)
 
 
 @dp.callback_query(F.data == "menu:balance")
@@ -1233,7 +1242,7 @@ async def cb_balance_period(cb: CallbackQuery):
             ])
         )
     except Exception as e:
-        await cb.answer(f"❌ Ошибка: {e}", show_alert=True)
+        await cb.answer(short(f"❌ Ошибка: {e}"), show_alert=True)
 
 
 @dp.callback_query(F.data == "menu:campaigns")
@@ -1249,7 +1258,7 @@ async def cb_menu_campaigns(cb: CallbackQuery):
         else:
             await cb.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     except Exception as e:
-        await cb.answer(f"❌ Ошибка: {e}", show_alert=True)
+        await cb.answer(short(f"❌ Ошибка: {e}"), show_alert=True)
 
 
 @dp.callback_query(F.data == "menu:bids")
@@ -1265,7 +1274,7 @@ async def cb_menu_bids(cb: CallbackQuery):
         else:
             await cb.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     except Exception as e:
-        await cb.answer(f"❌ Ошибка: {e}", show_alert=True)
+        await cb.answer(short(f"❌ Ошибка: {e}"), show_alert=True)
 
 
 # ---------- АВТОВКЛЮЧЕНИЕ: ОБРАБОТЧИКИ ----------
@@ -1284,11 +1293,11 @@ async def cb_auto_menu(cb: CallbackQuery):
     try:
         text, kb = await build_auto_menu_keyboard(page)
         if kb is None:
-            await cb.message.edit_text(text)
-        else:
-            await cb.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+            await cb.answer(short(text), show_alert=True)
+            return
+        await cb.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     except Exception as e:
-        await cb.answer(f"❌ Ошибка: {e}", show_alert=True)
+        await cb.answer(short(f"❌ Ошибка: {e}"), show_alert=True)
 
 
 @dp.callback_query(F.data.startswith("auto_toggle:"))
@@ -1341,7 +1350,7 @@ async def cb_paginate(cb: CallbackQuery):
 
     text, kb = await build_campaigns_keyboard(mode, page)
     if kb is None:
-        await cb.answer(text, show_alert=True)
+        await cb.answer(short(text), show_alert=True)
         return
     try:
         await cb.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
@@ -1363,7 +1372,7 @@ async def cb_limits_menu(cb: CallbackQuery):
 
     text, kb = await build_limits_keyboard(page)
     if kb is None:
-        await cb.answer(text, show_alert=True)
+        await cb.answer(short(text), show_alert=True)
         return
     try:
         await cb.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
@@ -1385,7 +1394,7 @@ async def cb_stats_menu(cb: CallbackQuery):
 
     text, kb = await build_stats_menu_keyboard(page)
     if kb is None:
-        await cb.answer(text, show_alert=True)
+        await cb.answer(short(text), show_alert=True)
         return
     try:
         await cb.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
@@ -1408,7 +1417,7 @@ async def cb_stats_view(cb: CallbackQuery):
         else:
             await cb.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     except Exception as e:
-        await cb.answer(f"❌ Ошибка: {e}", show_alert=True)
+        await cb.answer(short(f"❌ Ошибка: {e}"), show_alert=True)
 
 
 # ---------- СТАВКИ: КНОПКИ ----------
@@ -1425,7 +1434,7 @@ async def cb_bids_menu(cb: CallbackQuery):
 
     text, kb = await build_bids_menu_keyboard(page)
     if kb is None:
-        await cb.answer(text, show_alert=True)
+        await cb.answer(short(text), show_alert=True)
         return
     try:
         await cb.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
@@ -1454,7 +1463,7 @@ async def cb_bids_view(cb: CallbackQuery):
         else:
             await cb.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     except Exception as e:
-        await cb.answer(f"❌ Ошибка: {e}", show_alert=True)
+        await cb.answer(short(f"❌ Ошибка: {e}"), show_alert=True)
 
 
 @dp.callback_query(F.data.startswith("setbid:"))
@@ -1615,7 +1624,7 @@ async def cb_off(cb: CallbackQuery):
     cid = cb.data.split(":", 1)[1]
     try:
         await deactivate_campaign(int(cid))
-        await cb.answer(f"⏹ Кампания {cid} выключена", show_alert=True)
+        await cb.answer(short(f"⏹ Кампания {cid} выключена"), show_alert=True)
         text, kb = await build_campaigns_keyboard("cpc", 0)
         if kb:
             try:
@@ -1623,7 +1632,7 @@ async def cb_off(cb: CallbackQuery):
             except Exception:
                 pass
     except Exception as e:
-        await cb.answer(f"❌ Ошибка: {e}", show_alert=True)
+        await cb.answer(short(f"❌ Ошибка: {e}"), show_alert=True)
 
 
 @dp.callback_query(F.data.startswith("on:"))
@@ -1634,7 +1643,7 @@ async def cb_on(cb: CallbackQuery):
     cid = cb.data.split(":", 1)[1]
     try:
         await activate_campaign(int(cid))
-        await cb.answer(f"▶️ Кампания {cid} включена", show_alert=True)
+        await cb.answer(short(f"▶️ Кампания {cid} включена"), show_alert=True)
         text, kb = await build_campaigns_keyboard("cpc", 0)
         if kb:
             try:
@@ -1642,7 +1651,7 @@ async def cb_on(cb: CallbackQuery):
             except Exception:
                 pass
     except Exception as e:
-        await cb.answer(f"❌ Ошибка: {e}", show_alert=True)
+        await cb.answer(short(f"❌ Ошибка: {e}"), show_alert=True)
 
 
 # ---------- ПРОВЕРКА ПОРОГОВ И ЛИМИТОВ ----------
@@ -1693,12 +1702,10 @@ async def check_thresholds():
             state = camps_state.get(cid_str)
             name = camp_names.get(cid_str, cid_str)
 
-            # Если кампания уже не RUNNING — значит, мы её уже отключили ранее (или вручную).
-            # Больше никаких действий и уведомлений не делаем.
+            # Если кампания уже не RUNNING — мы её уже отключили или пользователь сам.
             if state != "CAMPAIGN_STATE_RUNNING":
                 continue
 
-            # Кампания активна и превысила лимит — отключаем
             try:
                 await deactivate_campaign(int(cid_str))
                 print(f"Кампания {cid_str} отключена (лимит {limit}, расход {spent:.2f}).")
@@ -1706,7 +1713,6 @@ async def check_thresholds():
                 print(f"Не удалось отключить кампанию {cid_str}: {e}")
                 continue
 
-            # Уведомление — только один раз в день
             if str(cid_str) not in triggered:
                 alert = format_limit_alert(name, cid_str, limit, spent)
                 for uid in ALLOWED_IDS:
@@ -1722,7 +1728,6 @@ async def check_thresholds():
 
 # ---------- АВТОВКЛЮЧЕНИЕ ПО РАСПИСАНИЮ (00:05 МСК) ----------
 async def auto_reactivate_campaigns():
-    """Каждый день в 00:05 МСК включает все кампании из списка автовключения."""
     try:
         data = load_auto_reactivate()
         campaign_ids = [cid for cid, val in data.items() if val]
